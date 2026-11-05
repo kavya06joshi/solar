@@ -1,0 +1,543 @@
+"""
+Dual-axis solar tracker v2 - Blender model WITH the real mechanisms
+-------------------------------------------------------------------
+HOW TO RUN
+  1. Open Blender, go to the "Scripting" workspace.
+  2. Text > Open > pick this file, then press "Run Script".
+  3. Press SPACE in the 3D viewport to play the sun-path animation.
+
+WHAT IS NEW COMPARED TO v1
+  * Poles are now 2-stage TELESCOPIC LINEAR ACTUATORS (base housing + two sliding
+    tubes + motor + top clevis). The tubes really slide in and out.
+  * The rotating mat sits on a SLEW DRIVE: fixed foundation + pedestal, a bearing,
+    a toothed slew ring (turns with the mat) and a WORM GEAR with motor that is
+    fixed to the ground. The worm spins while the ring turns (48 teeth).
+  * Wheels now roll on two GUIDE RAILS on the mat.
+  * Controller box on a post (cable to the foundation) and a WIND SENSOR
+    (spinning cups) on a mast - this is what triggers the "stow flat" mode.
+  * Three cameras: Cam_Main (active), Cam_Slew, Cam_Actuator.
+    To switch: click a camera in the Outliner, then View > Cameras > Set Active Object as Camera
+    (or Ctrl+Numpad0).
+
+The console prints how long the actuators must be over a FULL YEAR, because the
+sun is much higher in summer than on the day shown in the animation.
+"""
+import math
+import bpy
+from mathutils import Matrix, Vector
+
+# ============================== SETTINGS ==============================
+LATITUDE = 23.2          # Gandhinagar, India (degrees North)
+DAY_OF_YEAR = 306        # 2 Nov. Try 172 (21 Jun) or 355 (21 Dec)
+START_HOUR = 7.5         # solar time, 24h clock
+END_HOUR = 17.0
+FRAMES = 240             # animation length (24 fps -> 10 seconds)
+KEY_STEP = 4             # keyframe every N frames
+
+PANEL_COUNT = 4          # panels in one line  [][][][]
+PANEL_W = 2.2            # metres, along the row
+PANEL_L = 4.2            # metres, along the slope
+PANEL_GAP = 0.04
+PANEL_T = 0.04
+
+MAX_TILT = 65.0          # degrees from horizontal (morning / evening)
+MIN_TILT = 5.0          # near-flat limit at noon in summer (keeps actuator stroke shorter)
+
+WHEEL_R = 0.12
+SHOW_PERSON = True
+SHOW_LABELS = True
+
+SLEW_R = 0.42            # radius of the slew ring gear body, metres
+SLEW_TEETH = 48          # teeth on the slew ring (worm turns 48x per ring turn)
+ACT_BASE_H = 0.40        # height of the fixed actuator housing, metres
+# ======================================================================
+
+# ---------- derived dimensions ----------
+ROW_W = PANEL_COUNT * PANEL_W
+MAT_W = ROW_W + 1.0
+MAT_D = PANEL_L + 1.2
+MAT_Z0 = 0.90            # mat underside height (slew drive sits underneath)
+MAT_T = 0.15
+MAT_TOP = MAT_Z0 + MAT_T
+WHEEL_Z = MAT_TOP + 0.02 + WHEEL_R            # wheel centre height (sits on the rail)
+Z_B = MAT_TOP + 0.02 + 2 * WHEEL_R + 0.06     # height of the bottom hinge rail
+Y_POLE = PANEL_L / 2.0
+POLE_X = [-(ROW_W / 2 - 0.25), (ROW_W / 2 - 0.25)]
+WHEEL_X = list(POLE_X)
+RING_R = math.hypot(MAT_W / 2, MAT_D / 2) + 0.1
+
+# slew drive vertical layout
+RING_H = 0.14
+RING_ZC = MAT_Z0 - RING_H / 2                 # slew ring centre
+BEAR_H = 0.10
+BEAR_ZC = MAT_Z0 - RING_H - BEAR_H / 2        # fixed bearing base centre
+FOUND_H = 0.12                                # concrete foundation thickness
+PED_TOP = MAT_Z0 - RING_H - BEAR_H            # pedestal top
+TOOTH_RC = SLEW_R + 0.02                      # radius of tooth centres
+WORM_X = TOOTH_RC + 0.03 + 0.04               # worm axis x (fixed, on +X side)
+
+
+# ---------- helpers ----------
+def clear_scene():
+    if bpy.context.object and bpy.context.object.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+    bpy.ops.object.select_all(action='SELECT')
+    bpy.ops.object.delete(use_global=False)
+
+
+def make_mat(name, rgb, metallic=0.0, rough=0.5, emit=False):
+    m = bpy.data.materials.new(name)
+    m.diffuse_color = (*rgb, 1.0)
+    try:
+        m.use_nodes = True
+        bsdf = m.node_tree.nodes.get("Principled BSDF")
+        if bsdf:
+            bsdf.inputs["Base Color"].default_value = (*rgb, 1.0)
+            bsdf.inputs["Metallic"].default_value = metallic
+            bsdf.inputs["Roughness"].default_value = rough
+            if emit:
+                for key in ("Emission Color", "Emission"):
+                    if key in bsdf.inputs:
+                        bsdf.inputs[key].default_value = (*rgb, 1.0)
+                        break
+                if "Emission Strength" in bsdf.inputs:
+                    bsdf.inputs["Emission Strength"].default_value = 1.0
+    except Exception:
+        pass
+    return m
+
+
+def assign(obj, mat):
+    obj.data.materials.clear()
+    obj.data.materials.append(mat)
+
+
+def add_box(name, dims, loc, mat, parent=None):
+    bpy.ops.mesh.primitive_cube_add(size=1, location=loc)
+    o = bpy.context.active_object
+    o.name = name
+    o.scale = dims
+    assign(o, mat)
+    if parent:
+        o.parent = parent
+    return o
+
+
+def add_cyl(name, radius, depth, loc, mat, parent=None, bake=None, base_at_zero=False, verts=32):
+    bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=depth, location=loc, vertices=verts)
+    o = bpy.context.active_object
+    o.name = name
+    if bake is not None:
+        o.data.transform(bake)
+    if base_at_zero:
+        o.data.transform(Matrix.Translation((0, 0, depth / 2)))
+    assign(o, mat)
+    if parent:
+        o.parent = parent
+    return o
+
+
+def add_sphere(name, radius, loc, mat, parent=None):
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=radius, location=loc)
+    o = bpy.context.active_object
+    o.name = name
+    assign(o, mat)
+    if parent:
+        o.parent = parent
+    return o
+
+
+def add_rod(name, p1, p2, radius, mat, parent=None):
+    p1, p2 = Vector(p1), Vector(p2)
+    d = p2 - p1
+    bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=d.length,
+                                        location=(p1 + p2) / 2, vertices=12)
+    o = bpy.context.active_object
+    o.name = name
+    o.rotation_mode = 'QUATERNION'
+    o.rotation_quaternion = d.to_track_quat('Z', 'Y')
+    assign(o, mat)
+    if parent:
+        o.parent = parent
+    return o
+
+
+def make_camera(name, loc, target_loc, lens=50):
+    cd = bpy.data.cameras.new(name)
+    cd.lens = lens
+    cd.clip_end = 200
+    c = bpy.data.objects.new(name, cd)
+    bpy.context.collection.objects.link(c)
+    c.location = loc
+    bpy.ops.object.empty_add(type='PLAIN_AXES', location=target_loc)
+    t = bpy.context.active_object
+    t.name = name + "_Target"
+    tc = c.constraints.new('TRACK_TO')
+    tc.target = t
+    tc.track_axis = 'TRACK_NEGATIVE_Z'
+    tc.up_axis = 'UP_Y'
+    return c
+
+
+def add_label(text, loc, mat, cam, parent=None, size=0.2, align='CENTER'):
+    bpy.ops.object.text_add(location=loc)
+    o = bpy.context.active_object
+    o.name = "Label_" + text[:18]
+    o.data.body = text
+    o.data.size = size
+    o.data.align_x = align
+    assign(o, mat)
+    c = o.constraints.new('TRACK_TO')
+    c.target = LABEL_TARGET          # an empty that always follows the ACTIVE camera
+    c.track_axis = 'TRACK_Z'
+    c.up_axis = 'UP_Y'
+    if parent:
+        o.parent = parent
+    return o
+
+
+# ---------- sun model ----------
+def sun_position(hour, doy=None):
+    """Return (azimuth from North clockwise, elevation) in degrees for solar time."""
+    doy = DAY_OF_YEAR if doy is None else doy
+    lat = math.radians(LATITUDE)
+    decl = math.radians(23.45 * math.sin(math.radians(360.0 / 365.0 * (284 + doy))))
+    H = math.radians(15.0 * (hour - 12.0))
+    sin_el = math.sin(lat) * math.sin(decl) + math.cos(lat) * math.cos(decl) * math.cos(H)
+    el = math.asin(max(-1, min(1, sin_el)))
+    cos_az = (math.sin(decl) - math.sin(el) * math.sin(lat)) / (math.cos(el) * math.cos(lat))
+    az = math.acos(max(-1, min(1, cos_az)))
+    if H > 0:
+        az = 2 * math.pi - az
+    return math.degrees(az), math.degrees(el)
+
+
+def sun_vector(az, el):
+    a, e = math.radians(az), math.radians(el)
+    return Vector((math.sin(a) * math.cos(e), math.cos(a) * math.cos(e), math.sin(e)))
+
+
+def solve_pose(hour, doy=None):
+    az, el = sun_position(hour, doy)
+    tilt = max(MIN_TILT, min(MAX_TILT, 90.0 - el))
+    yaw = 180.0 - az
+    th = math.radians(tilt)
+    z_top = Z_B + PANEL_L * math.sin(th)
+    y_bot = Y_POLE - PANEL_L * math.cos(th)
+    return dict(az=az, el=el, tilt=tilt, yaw=yaw, th=th, z_top=z_top, y_bot=y_bot,
+                pole_h=z_top - MAT_TOP, wheel_dist=PANEL_L * math.cos(th))
+
+
+def annual_ranges():
+    """Pole height and wheel position extremes over a whole year (daylight only)."""
+    hs, ys = [], []
+    for doy in range(1, 366, 5):
+        for q in range(20, 80):
+            hour = q / 4.0
+            az, el = sun_position(hour, doy)
+            if el < 3:
+                continue
+            p = solve_pose(hour, doy)
+            hs.append(p["pole_h"])
+            ys.append(p["y_bot"])
+    return min(hs), max(hs), min(ys), max(ys)
+
+
+H_MIN, H_MAX, Y_MIN, Y_MAX = annual_ranges()
+
+# ============================== BUILD ==============================
+clear_scene()
+scene = bpy.context.scene
+
+m_ground = make_mat("Ground", (0.28, 0.42, 0.20), 0.0, 0.9)
+m_mat = make_mat("Mat", (0.55, 0.55, 0.58), 0.3, 0.6)
+m_steel = make_mat("Steel", (0.75, 0.77, 0.80), 0.9, 0.35)
+m_panel = make_mat("Panel", (0.03, 0.07, 0.25), 0.6, 0.15)
+m_tyre = make_mat("Tyre", (0.03, 0.03, 0.03), 0.0, 0.9)
+m_hub = make_mat("Hub", (0.9, 0.7, 0.1), 0.5, 0.4)
+m_sun = make_mat("SunBall", (1.0, 0.85, 0.2), 0.0, 0.3, emit=True)
+m_ring = make_mat("Ring", (0.2, 0.2, 0.22), 0.5, 0.5)
+m_person = make_mat("Person", (0.8, 0.45, 0.3), 0.0, 0.8)
+m_concrete = make_mat("Concrete", (0.5, 0.5, 0.48), 0.0, 0.9)
+m_gear = make_mat("GearSteel", (0.55, 0.58, 0.65), 0.9, 0.3)
+m_bearing = make_mat("Bearing", (0.15, 0.35, 0.65), 0.6, 0.4)
+m_motor = make_mat("Motor", (0.95, 0.35, 0.05), 0.4, 0.5)
+m_actbody = make_mat("ActuatorBody", (0.12, 0.14, 0.18), 0.6, 0.5)
+m_rail = make_mat("Rail", (0.85, 0.85, 0.2), 0.6, 0.4)
+m_marker = make_mat("WormMarker", (1.0, 0.8, 0.1), 0.3, 0.4)
+m_white = make_mat("White", (0.9, 0.9, 0.92), 0.1, 0.5)
+m_led = make_mat("LED", (0.1, 0.95, 0.2), 0.0, 0.3, emit=True)
+m_cable = make_mat("Cable", (0.02, 0.02, 0.02), 0.0, 0.8)
+m_label = make_mat("Label", (1.0, 1.0, 0.85), 0.0, 0.5, emit=True)
+m_leader = make_mat("Leader", (0.95, 0.95, 0.95), 0.0, 0.5)
+
+# ground + ring track
+bpy.ops.mesh.primitive_plane_add(size=40, location=(0, 0, 0))
+ground = bpy.context.active_object
+ground.name = "Ground"
+assign(ground, m_ground)
+add_cyl("RingTrack", RING_R, 0.04, (0, 0, 0.02), m_ring)
+
+# ---------- fixed part of the slew drive ----------
+add_box("Foundation", (1.4, 1.4, FOUND_H), (0, 0, FOUND_H / 2), m_concrete)
+ped_h = PED_TOP - FOUND_H
+add_cyl("Pedestal", 0.28, ped_h, (0, 0, FOUND_H + ped_h / 2), m_steel)
+add_cyl("BearingBase", SLEW_R - 0.03, BEAR_H, (0, 0, BEAR_ZC), m_bearing)
+
+# worm gear (fixed to the ground, spins)
+worm_len = 0.36
+bake_y = Matrix.Rotation(math.pi / 2, 4, 'X')                 # cylinder axis -> Y
+worm = add_cyl("Worm", 0.045, worm_len, (WORM_X, 0, RING_ZC), m_gear, bake=bake_y, verts=8)
+worm.rotation_mode = 'XYZ'
+for i in range(9):                                            # thread markers (spin with worm)
+    th = math.radians(i * 40)
+    add_box(f"WormThread_{i}", (0.03, 0.025, 0.03),
+            (0.05 * math.cos(th), -0.16 + i * 0.04, 0.05 * math.sin(th)), m_marker, parent=worm)
+for sgn in (-1, 1):
+    add_box(f"WormPlate_{sgn}", (0.14, 0.025, 0.17), (WORM_X, sgn * 0.19, RING_ZC), m_steel)
+add_box("WormBasePlate", (0.16, 0.42, 0.03), (WORM_X, 0, RING_ZC - 0.095), m_steel)
+blk_top = RING_ZC - 0.11
+add_box("WormSupport", (0.14, 0.30, blk_top - FOUND_H),
+        (WORM_X, 0, (FOUND_H + blk_top) / 2), m_steel)
+add_cyl("WormMotor", 0.07, 0.30, (WORM_X, 0.36, RING_ZC), m_motor, bake=bake_y)
+add_box("WormMotorCap", (0.10, 0.06, 0.10), (WORM_X, 0.53, RING_ZC), m_actbody)
+
+# ---------- rotating part (parent of everything that turns with the mat) ----------
+bpy.ops.object.empty_add(type='PLAIN_AXES', location=(0, 0, 0))
+turntable = bpy.context.active_object
+turntable.name = "Turntable"
+turntable.rotation_mode = 'XYZ'
+
+add_cyl("SlewRing", SLEW_R, RING_H, (0, 0, RING_ZC), m_gear, parent=turntable)
+for i in range(SLEW_TEETH):
+    a = 2 * math.pi * i / SLEW_TEETH
+    t = add_box(f"Tooth_{i}", (0.06, 0.03, RING_H - 0.02),
+                (TOOTH_RC * math.cos(a), TOOTH_RC * math.sin(a), RING_ZC), m_gear, parent=turntable)
+    t.rotation_euler = (0, 0, a)
+
+add_box("MatSlab", (MAT_W, MAT_D, MAT_T), (0, 0, MAT_Z0 + MAT_T / 2), m_mat, parent=turntable)
+
+# wheel guide rails on the mat
+rail_y0, rail_y1 = Y_MIN - 0.12, Y_MAX + 0.12
+for i, wx in enumerate(WHEEL_X):
+    add_box(f"GuideRail_{i}", (0.07, rail_y1 - rail_y0, 0.02),
+            (wx, (rail_y0 + rail_y1) / 2, MAT_TOP + 0.01), m_rail, parent=turntable)
+
+# ---------- telescopic linear actuators ----------
+stage1, stage2, clevis = [], [], []
+bake_act = Matrix.Rotation(math.pi / 2, 4, 'X')
+for i, px in enumerate(POLE_X):
+    add_box(f"ActFoot_{i}", (0.26, 0.26, 0.03), (px, Y_POLE, MAT_TOP + 0.015), m_steel, parent=turntable)
+    add_cyl(f"ActBase_{i}", 0.075, ACT_BASE_H, (px, Y_POLE, MAT_TOP + ACT_BASE_H / 2),
+            m_actbody, parent=turntable)
+    add_box(f"ActGearbox_{i}", (0.12, 0.12, 0.12), (px, Y_POLE + 0.07, MAT_TOP + 0.14),
+            m_actbody, parent=turntable)
+    add_cyl(f"ActMotor_{i}", 0.045, 0.22, (px, Y_POLE + 0.20, MAT_TOP + 0.14), m_motor,
+            parent=turntable, bake=bake_act)
+    s1 = add_cyl(f"ActStage1_{i}", 0.055, 1.0, (px, Y_POLE, MAT_TOP + ACT_BASE_H - 0.2), m_steel,
+                 parent=turntable, base_at_zero=True)
+    s2 = add_cyl(f"ActStage2_{i}", 0.04, 1.0, (px, Y_POLE, MAT_TOP + ACT_BASE_H), m_gear,
+                 parent=turntable, base_at_zero=True)
+    cl = add_box(f"ActClevis_{i}", (0.10, 0.10, 0.08), (px, Y_POLE, MAT_TOP + 1.0), m_hub,
+                 parent=turntable)
+    stage1.append(s1)
+    stage2.append(s2)
+    clevis.append(cl)
+
+top_rail = add_box("TopRail", (ROW_W, 0.08, 0.08), (0, Y_POLE, Z_B), m_steel, parent=turntable)
+bot_rail = add_box("BottomRail", (ROW_W, 0.08, 0.08), (0, 0, Z_B), m_steel, parent=turntable)
+
+# ---------- wheels (tyres) + brackets ----------
+roll_axis = Matrix.Rotation(math.pi / 2, 4, 'Y')       # cylinder axis -> X
+wheels, brackets = [], []
+bracket_h = Z_B - WHEEL_Z
+for i, wx in enumerate(WHEEL_X):
+    w = add_cyl(f"Wheel_{i}", WHEEL_R, 0.08, (wx, 0, WHEEL_Z), m_tyre,
+                parent=turntable, bake=roll_axis)
+    add_box(f"Hub_{i}", (0.10, 0.03, WHEEL_R * 1.7), (0, 0, 0), m_hub, parent=w)
+    wheels.append(w)
+    b = add_box(f"Bracket_{i}", (0.05, 0.05, bracket_h),
+                (wx, 0, WHEEL_Z + bracket_h / 2), m_steel, parent=turntable)
+    brackets.append(b)
+
+# ---------- panels [][][][] ----------
+panels = []
+for i in range(PANEL_COUNT):
+    x = (i - (PANEL_COUNT - 1) / 2.0) * PANEL_W
+    p = add_box(f"Panel_{i}", (PANEL_W - PANEL_GAP, PANEL_L, PANEL_T), (x, 0, Z_B), m_panel,
+                parent=turntable)
+    panels.append(p)
+
+# ---------- controller box + cable ----------
+CTRL = (4.3, 1.0)
+add_cyl("ControllerPost", 0.04, 1.1, (CTRL[0], CTRL[1], 0.55), m_steel)
+add_box("ControllerBox", (0.42, 0.16, 0.55), (CTRL[0], CTRL[1], 1.1 + 0.275), m_white)
+add_sphere("ControllerLED", 0.025, (CTRL[0] + 0.14, CTRL[1] - 0.085, 1.1 + 0.45), m_led)
+add_cyl("Antenna", 0.01, 0.30, (CTRL[0] - 0.15, CTRL[1], 1.1 + 0.55 + 0.15), m_actbody)
+add_rod("Cable", (CTRL[0], CTRL[1], 0.06), (0.69, -0.5, 0.07), 0.015, m_cable)
+
+# ---------- wind sensor (anemometer) ----------
+WIND = (-3.9, 2.3, 3.6)
+add_cyl("WindMast", 0.03, WIND[2], (WIND[0], WIND[1], WIND[2] / 2), m_steel)
+bpy.ops.object.empty_add(type='PLAIN_AXES', location=WIND)
+anemo = bpy.context.active_object
+anemo.name = "WindHub"
+anemo.rotation_mode = 'XYZ'
+for k in range(3):
+    a = math.radians(k * 120)
+    arm = add_box(f"WindArm_{k}", (0.45, 0.03, 0.03),
+                  (0.225 * math.cos(a), 0.225 * math.sin(a), 0), m_steel, parent=anemo)
+    arm.rotation_euler = (0, 0, a)
+    add_sphere(f"WindCup_{k}", 0.07, (0.45 * math.cos(a), 0.45 * math.sin(a), 0), m_hub, parent=anemo)
+
+# ---------- scale person ----------
+if SHOW_PERSON:
+    add_cyl("Person_body", 0.17, 1.4, (-3.8, -3.0, 0.7), m_person)
+    add_sphere("Person_head", 0.14, (-3.8, -3.0, 1.56), m_person)
+
+# ---------- sun ----------
+sun_data = bpy.data.lights.new("SunLight", 'SUN')
+sun_data.energy = 4.0
+sun_lamp = bpy.data.objects.new("SunLight", sun_data)
+bpy.context.collection.objects.link(sun_lamp)
+sun_lamp.rotation_mode = 'QUATERNION'
+sun_ball = add_sphere("SunBall", 0.6, (0, 0, 20), m_sun)
+
+# ---------- cameras ----------
+cam_main = make_camera("Cam_Main", (10.5, -11.5, 6.5), (0, 0, 1.4))
+cam_slew = make_camera("Cam_Slew", (4.6, -3.4, 0.55), (0.4, 0, 0.8), lens=35)
+cam_act = make_camera("Cam_Actuator", (-3.0, 3.6, 1.9), (-1.75, 1.0, 1.7), lens=35)
+scene.camera = cam_main
+
+# labels turn to face whichever camera is active (so they read correctly in every view)
+bpy.ops.object.empty_add(type='PLAIN_AXES', location=cam_main.location)
+LABEL_TARGET = bpy.context.active_object
+LABEL_TARGET.name = "LabelTarget"
+
+
+def _label_target_follow(scene, depsgraph=None):
+    tgt = bpy.data.objects.get("LabelTarget")
+    cam = scene.camera
+    if tgt is not None and cam is not None:
+        pos = cam.matrix_world.translation
+        if (tgt.location - pos).length > 1e-4:
+            tgt.location = pos
+
+
+for _h in list(bpy.app.handlers.depsgraph_update_post):      # avoid duplicates on re-run
+    if getattr(_h, "__name__", "") == "_label_target_follow":
+        bpy.app.handlers.depsgraph_update_post.remove(_h)
+bpy.app.handlers.depsgraph_update_post.append(_label_target_follow)
+
+# ---------- labels (set SHOW_LABELS = False to hide) ----------
+if SHOW_LABELS:
+    L = add_label
+    L("Linear actuator x2 (telescopic)", (POLE_X[0] - 0.75, Y_POLE, MAT_TOP + ACT_BASE_H + 0.9),
+      m_label, cam_main, parent=turntable, size=0.2, align='RIGHT')
+    add_rod("Leader_actuator", (POLE_X[0] - 0.72, Y_POLE, MAT_TOP + ACT_BASE_H + 0.85),
+            (POLE_X[0] - 0.08, Y_POLE, MAT_TOP + ACT_BASE_H + 0.45), 0.008, m_leader, parent=turntable)
+    L("Wheels roll on guide rails (passive)", (WHEEL_X[1] + 0.35, -1.45, MAT_TOP + 0.12),
+      m_label, cam_main, parent=turntable, size=0.17, align='LEFT')
+    L("Slew drive: worm gear + ring", (WORM_X + 0.9, -2.2, 0.55), m_label, cam_main,
+      size=0.2, align='LEFT')
+    add_rod("Leader_slew", (WORM_X + 0.85, -2.1, 0.58), (WORM_X, -0.1, RING_ZC), 0.008, m_leader)
+    L("Controller + clock", (CTRL[0], CTRL[1], 2.0), m_label, cam_main, size=0.2)
+    L("Wind sensor", (WIND[0], WIND[1], WIND[2] + 0.45), m_label, cam_main, size=0.2)
+
+# sky colour
+if scene.world is None:
+    scene.world = bpy.data.worlds.new("World")
+scene.world.color = (0.55, 0.75, 0.95)
+
+
+# ============================== POSE + ANIMATION ==============================
+def key(obj, prop, frame):
+    obj.keyframe_insert(prop, frame=frame)
+
+
+def apply_pose(pose, frame):
+    DIST = 14.0
+    turntable.rotation_euler = (0, 0, math.radians(pose["yaw"]))
+    key(turntable, "rotation_euler", frame)
+
+    # worm spins SLEW_TEETH times faster than the ring
+    worm.rotation_euler = (0, math.radians(pose["yaw"]) * SLEW_TEETH, 0)
+    key(worm, "rotation_euler", frame)
+
+    # actuators: two telescopic stages share the extension equally
+    ext = max(0.0, pose["pole_h"] - ACT_BASE_H)
+    seg = 0.2 + ext / 2.0
+    for s1, s2, cl, px in zip(stage1, stage2, clevis, POLE_X):
+        s1.scale = (1, 1, seg)
+        key(s1, "scale", frame)
+        s2.location = (px, Y_POLE, MAT_TOP + ACT_BASE_H + ext / 2.0 - 0.2)
+        s2.scale = (1, 1, seg)
+        key(s2, "location", frame)
+        key(s2, "scale", frame)
+        cl.location = (px, Y_POLE, MAT_TOP + pose["pole_h"])
+        key(cl, "location", frame)
+
+    top_rail.location = (0, Y_POLE, pose["z_top"])
+    key(top_rail, "location", frame)
+    bot_rail.location = (0, pose["y_bot"], Z_B)
+    key(bot_rail, "location", frame)
+
+    spin = -pose["y_bot"] / WHEEL_R
+    for w, wx in zip(wheels, WHEEL_X):
+        w.location = (wx, pose["y_bot"], WHEEL_Z)
+        w.rotation_euler = (spin, 0, 0)
+        key(w, "location", frame)
+        key(w, "rotation_euler", frame)
+    for b, wx in zip(brackets, WHEEL_X):
+        b.location = (wx, pose["y_bot"], WHEEL_Z + bracket_h / 2)
+        key(b, "location", frame)
+
+    cy = (Y_POLE + pose["y_bot"]) / 2.0
+    cz = (Z_B + pose["z_top"]) / 2.0
+    for p in panels:
+        x = p.location.x
+        p.location = (x, cy, cz)
+        p.rotation_euler = (pose["th"], 0, 0)
+        key(p, "location", frame)
+        key(p, "rotation_euler", frame)
+
+    anemo.rotation_euler = (0, 0, (frame - 1) * 0.9)
+    key(anemo, "rotation_euler", frame)
+
+    v = sun_vector(pose["az"], pose["el"])
+    sun_ball.location = v * DIST
+    key(sun_ball, "location", frame)
+    sun_lamp.rotation_quaternion = v.to_track_quat('Z', 'Y')
+    key(sun_lamp, "rotation_quaternion", frame)
+
+
+scene.frame_start = 1
+scene.frame_end = FRAMES
+scene.render.fps = 24
+
+frames = list(range(1, FRAMES + 1, KEY_STEP))
+if frames[-1] != FRAMES:
+    frames.append(FRAMES)
+
+print("\nhour  azimuth  elevation  tilt  yaw   pole_h  wheel_dist")
+prev_yaw = None
+for f in frames:
+    hour = START_HOUR + (END_HOUR - START_HOUR) * (f - 1) / (FRAMES - 1)
+    pose = solve_pose(hour)
+    if prev_yaw is not None:                       # avoid 360-degree jumps
+        while pose["yaw"] - prev_yaw > 180:
+            pose["yaw"] -= 360
+        while pose["yaw"] - prev_yaw < -180:
+            pose["yaw"] += 360
+    prev_yaw = pose["yaw"]
+    apply_pose(pose, f)
+    if (f - 1) % (KEY_STEP * 10) == 0 or f == FRAMES:
+        print(f"{hour:5.2f} {pose['az']:7.1f} {pose['el']:9.1f} {pose['tilt']:6.1f} "
+              f"{pose['yaw']:6.1f} {pose['pole_h']:7.2f} {pose['wheel_dist']:9.2f}")
+
+scene.frame_set(1)
+print("\n--- FULL-YEAR REQUIREMENTS (daylight hours, tilt limited to %.0f-%.0f deg) ---" % (MIN_TILT, MAX_TILT))
+print("Pole top height : %.2f m to %.2f m  -> actuator stroke needed = %.2f m" % (H_MIN, H_MAX, H_MAX - H_MIN))
+print("Wheel position  : %.2f m to %.2f m along the mat (travel %.2f m)" % (Y_MIN, Y_MAX, Y_MAX - Y_MIN))
+print("Slew ring       : %d teeth -> worm turns %d times per full ring turn" % (SLEW_TEETH, SLEW_TEETH))
+print("\nDone. Press SPACE in the 3D viewport to play. Cameras: Cam_Main, Cam_Slew, Cam_Actuator.")
